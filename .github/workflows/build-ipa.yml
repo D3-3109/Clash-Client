@@ -1,0 +1,318 @@
+name: Build unsigned iOS IPA
+
+# README requires Xcode 27+. macos-26 images stop at Xcode 26; xcode-27 is the
+# macOS runner image that carries Xcode 27. Push on this branch runs the
+# workflow before it exists on the default branch. workflow_dispatch is
+# available once the file is on the default branch.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Clash-Client ref to build (branch/tag/SHA)
+        default: main
+      bundle_base:
+        description: Bundle identifier base (app = base, tunnel = base.extension)
+        default: org.example.clash
+  push:
+    branches:
+      - cursor/unsigned-ios-ipa-5bbf
+
+concurrency:
+  group: unsigned-ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 240
+    env:
+      GOTOOLCHAIN: auto
+      GOMAXPROCS: "2"
+      GOMEMLIMIT: 5GiB
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+
+      - name: Select newest Xcode
+        run: |
+          set -euo pipefail
+          echo "Xcode apps:"
+          ls -d /Applications/Xcode*.app
+          X=$(python3 - <<'PY'
+          import glob, os
+          paths = glob.glob("/Applications/Xcode_*.app")
+          reals = {os.path.realpath(p) for p in paths if os.path.exists(p)}
+          def key(path):
+              name = os.path.basename(path).replace("Xcode_", "").replace(".app", "")
+              parts = []
+              for piece in name.split("."):
+                  try:
+                      parts.append(int(piece))
+                  except ValueError:
+                      parts.append(0)
+              return parts
+          if not reals:
+              raise SystemExit("no Xcode_*.app found")
+          print(sorted(reals, key=key)[-1])
+          PY
+          )
+          echo "Using $X"
+          sudo xcode-select -s "$X/Contents/Developer"
+          echo "DEVELOPER_DIR=$X/Contents/Developer" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcodebuild -showsdks
+          echo "Selected Xcode: $X" | tee build-xcode.txt
+          df -h /
+          # The runner disk is small and several Xcode copies plus the Android
+          # SDK are unused. The iOS/tvOS SDKs live inside the selected Xcode.
+          for app in /Applications/Xcode_*.app /Applications/Xcode.app; do
+            [ -e "$app" ] || continue
+            real=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$app")
+            if [ "$real" != "$X" ]; then
+              echo "Removing $app"
+              sudo rm -rf "$app"
+            fi
+          done
+          rm -rf "$HOME/Library/Android" /usr/local/lib/android "$HOME/Library/Caches/Homebrew" || true
+          # Simulator runtimes are not needed to archive a device build or to
+          # compile the simulator SDK slices (those SDKs are inside Xcode).
+          xcrun simctl delete all || true
+          if xcrun simctl runtime delete --help >/dev/null 2>&1; then
+            xcrun simctl runtime delete all || true
+          fi
+          df -h /
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.11"
+          check-latest: false
+          cache: false
+
+      - name: Force Go toolchain auto-selection
+        run: |
+          set -euo pipefail
+          # setup-go exports GOTOOLCHAIN=local, which blocks the pin in the
+          # kernel bind module (toolchain go1.26.11).
+          go env -w GOTOOLCHAIN=auto
+          echo "GOTOOLCHAIN=auto" >> "$GITHUB_ENV"
+          go version
+          go env GOTOOLCHAIN GOROOT GOPATH
+
+      - name: Tools
+        run: |
+          set -euo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            curl -fsSL -o /tmp/xcodegen.zip -L https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip
+            rm -rf /tmp/xcodegen
+            unzip -q /tmp/xcodegen.zip -d /tmp/xcodegen
+            sudo PREFIX=/usr/local /tmp/xcodegen/xcodegen/install.sh
+          fi
+          xcodegen --version
+          python3 -m venv .build/python-env
+          .build/python-env/bin/pip install --disable-pip-version-check PyYAML
+          xcodebuild -showsdks | grep -q appletvos || xcodebuild -downloadPlatform tvOS
+          xcodebuild -showsdks | grep -q iphoneos || xcodebuild -downloadPlatform iOS
+          df -h /
+
+      - name: Restore SDK cache
+        id: sdk-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .build/dependencies
+          key: clash-apple-sdk-${{ hashFiles('Dependencies.lock.json') }}-go1.26.11
+
+      - name: Bootstrap (build Clash.xcframework from pinned kernel)
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          .build/python-env/bin/python scripts/bootstrap.py 2>&1 | tee build/bootstrap.log
+          test -e Clash.xcframework
+
+      - name: Save SDK cache
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .build/dependencies
+          key: clash-apple-sdk-${{ hashFiles('Dependencies.lock.json') }}-go1.26.11
+
+      - name: Free disk after SDK build
+        run: |
+          set -euo pipefail
+          go clean -cache || true
+          # Kernel sources and the module download are no longer needed; the
+          # xcframework and its inventory receipt stay in place.
+          find .build/dependencies/kernel -mindepth 1 -maxdepth 1 ! -name Clash.xcframework -exec rm -rf {} +
+          rm -rf "$(go env GOMODCACHE)" "$(go env GOCACHE)" || true
+          df -h /
+
+      - name: Configure (XcodeGen)
+        env:
+          BUNDLE_BASE: ${{ inputs.bundle_base || 'org.example.clash' }}
+        run: |
+          set -euo pipefail
+          .build/python-env/bin/python scripts/configure.py --bundle-base "$BUNDLE_BASE" 2>&1 | tee build/configure.log
+          test -d apple/ClashClient/ClashClient.xcodeproj
+
+      - name: Archive ClashiOS unsigned
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          set +e
+          xcodebuild -project apple/ClashClient/ClashClient.xcodeproj \
+            -scheme ClashiOS -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$PWD/build/Clash.xcarchive" \
+            -derivedDataPath "$PWD/build/DerivedData" \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            CLASH_SOURCE_REVISION="$(git rev-parse --short HEAD)" \
+            archive >build/xcodebuild.log 2>&1
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "xcodebuild archive exited $status"
+            grep -E "error:" build/xcodebuild.log | tail -n 100 || true
+            echo "----- tail -----"
+            tail -n 160 build/xcodebuild.log
+            exit "$status"
+          fi
+          echo "ARCHIVE SUCCEEDED"
+          test -d build/Clash.xcarchive/Products/Applications/Clash.app
+          # DerivedData is large and the product we package lives in the archive.
+          rm -rf build/DerivedData
+          df -h /
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP=build/Clash.xcarchive/Products/Applications/Clash.app
+          test -d "$APP/PlugIns"
+          test -n "$(find "$APP/PlugIns" -name '*.appex' -print -quit)"
+          test -d "$APP/Frameworks/Clash.framework"
+          BIN="$APP/Clash"
+          vtool -show-build "$BIN" | tee build/vtool.txt
+          if grep -q IOSSIMULATOR build/vtool.txt; then
+            echo "archive produced a simulator binary"
+            exit 1
+          fi
+          grep -q IOS build/vtool.txt
+          file "$BIN"
+          rm -rf out
+          mkdir -p out/Payload
+          ditto "$APP" out/Payload/Clash.app
+          SHA=$(git rev-parse --short HEAD)
+          FULL=$(git rev-parse HEAD)
+          VER=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$APP/Info.plist")
+          BUILD=$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' "$APP/Info.plist")
+          IPA="Clash-iOS-${VER}-${SHA}-unsigned.ipa"
+          ditto -c -k --norsrc --keepParent out/Payload "$IPA"
+          mkdir -p dist/entitlements
+          while IFS= read -r -d '' f; do
+            rel=${f#./}
+            mkdir -p "dist/entitlements/$(dirname "$rel")"
+            cp "$f" "dist/entitlements/$rel"
+          done < <(find apple/ClashClient cli -name '*.entitlements' -print0)
+          {
+            echo "app: $(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$APP/Info.plist")"
+            for p in "$APP"/PlugIns/*.appex; do
+              [ -d "$p" ] || continue
+              echo "$(basename "$p"): $(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$p/Info.plist")"
+            done
+            for p in "$APP"/Frameworks/*.framework; do
+              [ -d "$p" ] || continue
+              id=$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$p/Info.plist" 2>/dev/null || true)
+              echo "$(basename "$p"): ${id:-unknown}"
+            done
+          } | tee dist/bundle-ids.txt
+          {
+            echo "version: $VER ($BUILD)"
+            echo "commit: $FULL"
+            echo "short: $SHA"
+            echo "xcode: $(xcodebuild -version | tr '\n' ' ')"
+          } | tee dist/commit.txt
+          {
+            echo "Unsigned iOS archive of Clash-Client $FULL"
+            echo "Marketing version $VER ($BUILD)"
+            echo
+            echo "Bundle IDs:"
+            cat dist/bundle-ids.txt
+            echo
+            echo "Entitlements (from the generated entitlements files; the binary is unsigned):"
+            find dist/entitlements -name '*.entitlements' | sort | while read -r f; do
+              echo "===== $f ====="
+              plutil -p "$f"
+            done
+          } | tee dist/required-entitlements.txt
+          shasum -a 256 "$IPA" | tee dist/SHA256SUMS
+          mv "$IPA" dist/
+          unzip -l "dist/$IPA" | grep -E 'Payload/Clash.app/PlugIns/.*\.appex/' >/dev/null
+          ls -lh "dist/$IPA"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Clash-iOS-unsigned
+          path: dist/
+          if-no-files-found: error
+
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse --short=12 HEAD)
+          FULL=$(git rev-parse HEAD)
+          VER=$(sed -n 's/^version: //p' dist/commit.txt)
+          TAG="ios-unsigned-${SHA}"
+          NOTES=$(mktemp)
+          {
+            echo "Unsigned iOS IPA built from \`$FULL\`."
+            echo
+            echo "This archive is not signed and will not install until you sign it with your own Apple Developer team. Bundle identifiers and entitlements are in the attached files."
+            echo
+            echo '```'
+            cat dist/commit.txt
+            echo
+            cat dist/bundle-ids.txt
+            echo
+            cat dist/SHA256SUMS
+            echo '```'
+          } > "$NOTES"
+          files=()
+          while IFS= read -r -d '' f; do
+            files+=("$f")
+          done < <(find dist -type f -print0)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" --clobber
+          else
+            gh release create "$TAG" "${files[@]}" \
+              --prerelease \
+              --target "$FULL" \
+              --title "Clash iOS ${VER} unsigned (${SHA})" \
+              --notes-file "$NOTES"
+          fi
+          gh release view "$TAG" --json url,tagName --jq '.url'
+
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build/xcodebuild.log
+            build/bootstrap.log
+            build/configure.log
+            build/vtool.txt
+          if-no-files-found: ignore
