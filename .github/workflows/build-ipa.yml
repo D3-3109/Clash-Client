@@ -105,11 +105,24 @@ jobs:
       - name: Tools
         run: |
           set -euo pipefail
-          if ! command -v xcodegen >/dev/null 2>&1; then
+          # XcodeGen 2.46 emits a PBXGroup child ("apple") from more than one parent.
+          # Xcode 27.2 rejects that project. PR 1652 removes the extra membership;
+          # fall back to the release binary plus a pbxproj repair if the branch
+          # does not build.
+          install_xcodegen_release() {
             curl -fsSL -o /tmp/xcodegen.zip -L https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip
             rm -rf /tmp/xcodegen
             unzip -q /tmp/xcodegen.zip -d /tmp/xcodegen
             sudo PREFIX=/usr/local /tmp/xcodegen/xcodegen/install.sh
+            echo "XCODEGEN_REPAIR=1" >> "$GITHUB_ENV"
+          }
+          if git clone --depth 1 --branch fix-multiple-parent-groups https://github.com/Ckitakishi/XcodeGen.git "$RUNNER_TEMP/XcodeGen-src" \
+            && (cd "$RUNNER_TEMP/XcodeGen-src" && swift build -c release --product xcodegen); then
+            sudo ln -sfn "$RUNNER_TEMP/XcodeGen-src/.build/release/xcodegen" /usr/local/bin/xcodegen
+            echo "XCODEGEN_REPAIR=0" >> "$GITHUB_ENV"
+          else
+            echo "Patched XcodeGen did not build; using 2.46.0"
+            install_xcodegen_release
           fi
           xcodegen --version
           python3 -m venv .build/python-env
@@ -157,6 +170,65 @@ jobs:
           set -euo pipefail
           .build/python-env/bin/python scripts/configure.py --bundle-base "$BUNDLE_BASE" 2>&1 | tee build/configure.log
           test -d apple/ClashClient/ClashClient.xcodeproj
+
+      - name: Repair duplicate Xcode groups
+        if: env.XCODEGEN_REPAIR == '1'
+        run: |
+          set -euo pipefail
+          .build/python-env/bin/python - <<'PY'
+          import json, subprocess, sys
+          from collections import defaultdict
+          from pathlib import Path
+
+          pbx = Path("apple/ClashClient/ClashClient.xcodeproj/project.pbxproj")
+          js = Path("build/project.json")
+          js.parent.mkdir(parents=True, exist_ok=True)
+          subprocess.check_call(["plutil", "-convert", "json", "-o", str(js), str(pbx)])
+          proj = json.loads(js.read_text())
+          objects = proj["objects"]
+          main = objects[proj["rootObject"]]["mainGroup"]
+
+          def label(oid):
+              obj = objects.get(oid, {})
+              return obj.get("name") or obj.get("path") or oid
+
+          parents = defaultdict(list)
+          group_isas = ("PBXGroup", "PBXVariantGroup", "XCVersionGroup")
+          for oid, obj in objects.items():
+              if obj.get("isa") in group_isas:
+                  for child in obj.get("children") or []:
+                      parents[child].append(oid)
+          dups = {child: ps for child, ps in parents.items() if len(ps) > 1}
+          if not dups:
+              print("group membership is already unique")
+              sys.exit(0)
+          for child, ps in sorted(dups.items(), key=lambda item: label(item[0])):
+              print(f"duplicate {label(child)} ({objects[child].get('isa')}) parents={[label(p) for p in ps]}")
+              if main not in ps:
+                  print(f"unhandled duplicate {label(child)}", file=sys.stderr)
+                  sys.exit(1)
+              objects[main]["children"] = [c for c in objects[main].get("children") or [] if c != child]
+              obj = objects[child]
+              path = obj.get("path") or ""
+              if obj.get("isa") == "PBXGroup" and obj.get("sourceTree") == "<group>" and "/" in path:
+                  last = path.rsplit("/", 1)[-1]
+                  print(f"  path {path} -> {last}")
+                  obj["path"] = last
+                  if obj.get("name") == last:
+                      obj.pop("name", None)
+          parents = defaultdict(list)
+          for oid, obj in objects.items():
+              if obj.get("isa") in group_isas:
+                  for child in obj.get("children") or []:
+                      parents[child].append(oid)
+          left = [label(child) for child, ps in parents.items() if len(ps) > 1]
+          if left:
+              print("still duplicated: " + ", ".join(left), file=sys.stderr)
+              sys.exit(1)
+          js.write_text(json.dumps(proj))
+          subprocess.check_call(["plutil", "-convert", "xml1", "-o", str(pbx), str(js)])
+          print("rewrote", pbx)
+          PY
 
       - name: Archive ClashiOS unsigned
         run: |
